@@ -3,16 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
-	"github.com/joho/godotenv"
-	"github.com/tyler-smith/go-bip39"
 	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
@@ -24,23 +20,19 @@ type EstimateRequestPayload struct {
 	InitData     string `json:"initData"`
 }
 
-func checkErr(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func createTransactionBody(message, amount string) (string, error) {
+func createTransactionBody(message string) (string, error) {
 	builder := cell.BeginCell()
 
-	err := builder.StoreBinarySnake([]byte(message + " " + amount))
+	err := builder.StoreBinarySnake([]byte(message))
 	if err != nil {
 		return "", fmt.Errorf("error storing data in cell: %v", err)
 	}
 
 	cellBody := builder.EndCell()
 	bocBytes := cellBody.ToBOC()
+
 	bocBase64 := base64.StdEncoding.EncodeToString(bocBytes)
+
 	return bocBase64, nil
 }
 
@@ -52,25 +44,32 @@ func EstimateFee(walletAddress, body string) (float64, error) {
 		InitCode:     "",
 		InitData:     "",
 	}
+
 	requestBody, err := json.Marshal(requestPayload)
 	if err != nil {
 		return 0, fmt.Errorf("error marshaling request: %s", err)
 	}
+
 	url := "https://toncenter.com/api/v2/estimateFee"
+
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return 0, fmt.Errorf("error creating request: %s", err)
 	}
+
 	req.Header.Set("Content-Type", "application/json")
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("error sending request: %s", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("failed to get estimate fee: %s", resp.Status)
 	}
+
 	var respPayload struct {
 		Ok     bool `json:"ok"`
 		Result struct {
@@ -82,49 +81,40 @@ func EstimateFee(walletAddress, body string) (float64, error) {
 			} `json:"source_fees"`
 		} `json:"result"`
 	}
+
 	err = json.NewDecoder(resp.Body).Decode(&respPayload)
 	if err != nil {
 		return 0, fmt.Errorf("error decoding response: %s", err)
 	}
+
 	if !respPayload.Ok {
 		return 0, fmt.Errorf("error estimating fee: invalid response")
 	}
+
 	totalFee := float64(respPayload.Result.SourceFees.InFwdFee +
 		respPayload.Result.SourceFees.StorageFee +
 		respPayload.Result.SourceFees.GasFee +
 		respPayload.Result.SourceFees.FwdFee)
+
 	totalFeeInNano := totalFee / 1000000000.0
+
+	fmt.Printf("Total estimated fee: %.9f TON.\n", totalFeeInNano)
+
 	return totalFeeInNano, nil
 }
 
-func generateAddressFromMnemonic(mnemonic string) string {
-	seed := bip39.NewSeed(mnemonic, "")
-	address := hex.EncodeToString(seed[:32])
-	return address
-}
-
 func main() {
-	_ = godotenv.Load(".env")
-	var walletAddress string
-	if _, err := os.Stat(".env"); err == nil {
-		walletAddress = os.Getenv("WALLET_ADDRESS")
-	} else {
-		entropy, err := bip39.NewEntropy(256)
-		checkErr(err)
-		mnemonic, err := bip39.NewMnemonic(entropy)
-		checkErr(err)
-		seed := hex.EncodeToString(bip39.NewSeed(mnemonic, ""))
-		walletAddress = generateAddressFromMnemonic(mnemonic)
-		err = godotenv.Write(map[string]string{
-			"MNEMONIC":       mnemonic,
-			"SEED":           seed,
-			"WALLET_ADDRESS": walletAddress,
-		}, ".env")
-		checkErr(err)
+	walletAddress := "EQDJlZqZfh1OQ4PY2ze4bSEBznjc8fGzkE2YiP5XLvDv1M6u"
+
+	transactionBody, err := createTransactionBody("te6ccgECEAEAAigAART/APSkE/S88sgLAQIBIAIDAgFIBAUB9vLUgwjXGNEh+QDtRNDT/9Mf9AT0BNM/0xXR+CMhoVIguY4SM234IySqAKESuZJtMt5Y+CMB3lQWdfkQ8qEG0NMf1NMH0wzTCdM/0xXRUWi68qJRWrrypvgjKqFSULzyowT4I7vyo1MEgA30D2+hmdAk1yHXCgDyZJEw4g4AeNAg10vAAQHAYLCRW+EB0NMDAXGwkVvg+kAw+CjHBbORMODTHwGCEK5C5aS6nYBA1yHXTPgqAe1V+wTgMAIBIAYHAgJzCAkCASAMDQARrc52omhrhf/AAgEgCgsAGqu27UTQgQEi1yHXCz8AGKo77UTQgwfXIdcLHwAbuabu1E0IEBYtch1wsVgA5bi/Ltou37IasJAoQJsO1E0IEBINch9AT0BNM/0xXRBY4b+CMloVIQuZ8ybfgjBaoAFaESuZIwbd6SMDPikjAz4lIwgA30D2+hntAh1yHXCgCVXwN/2zHgkTDiWYAN9A9voZzQAdch1woAk3/bMeCRW+JwgB/lMJgA30D2+hjhPQUATXGNIAAfJkyFjPFs+DAc8WjhAwyCTPQM+DhAlQBaGlFM9A4vgAyUA5gA30FwTIy/8Tyx/0ABL0ABLLPxLLFcntVPgPIdDTAAHyZdMCAXGwkl8D4PpAAdcLAcAA8qX6QDH6ADH0AfoAMfoAMYBg1yHTAAEPACDyZdIAAZPUMdGRMOJysfsA")
+	if err != nil {
+		log.Fatalf("Error creating transaction body: %v", err)
 	}
-	transactionBody, err := createTransactionBody("Test transaction message to "+walletAddress, "1000000000")
-	checkErr(err)
+
 	fee, err := EstimateFee(walletAddress, transactionBody)
-	checkErr(err)
+	if err != nil {
+		log.Fatalf("Error estimating fee: %v", err)
+	}
+
 	fmt.Printf("Estimated fee: %.9f TON\n", fee)
 }
