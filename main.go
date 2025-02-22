@@ -7,42 +7,49 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/tyler-smith/go-bip39"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tvm/cell"
+	"golang.org/x/crypto/ed25519"
 )
 
-type EstimateRequestPayload struct {
-	Address      string `json:"address"`
-	Body         string `json:"body"`
-	IgnoreChksig bool   `json:"ignoreChksig"`
-	InitCode     string `json:"initCode"`
-	InitData     string `json:"initData"`
-}
-
-func createTransactionBody(message string) (string, error) {
-	builder := cell.BeginCell()
-
-	err := builder.StoreBinarySnake([]byte(message))
+// GenerateWalletData generates a wallet's data including public/private key, address, mnemonic, and seed.
+func GenerateWalletData() (string, string, string, string, string) {
+	entropy, err := bip39.NewEntropy(256)
 	if err != nil {
-		return "", fmt.Errorf("error storing data in cell: %v", err)
+		log.Fatal(err)
 	}
 
-	cellBody := builder.EndCell()
-	bocBytes := cellBody.ToBOC()
+	mnemonic, err := bip39.NewMnemonic(entropy)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	bocBase64 := base64.StdEncoding.EncodeToString(bocBytes)
+	seed := bip39.NewSeed(mnemonic, "")
+	privateKey := ed25519.NewKeyFromSeed(seed[:32])
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	address := generateAddressFromPublicKey(publicKey)
 
-	return bocBase64, nil
+	return base64.StdEncoding.EncodeToString(publicKey), base64.StdEncoding.EncodeToString(privateKey), address, mnemonic, string(seed)
 }
 
-func EstimateFee(walletAddress, body string) (float64, error) {
-	requestPayload := EstimateRequestPayload{
-		Address:      walletAddress,
-		Body:         body,
-		IgnoreChksig: true,
-		InitCode:     "",
-		InitData:     "",
+// generateAddressFromPublicKey generates a wallet address from a public key.
+func generateAddressFromPublicKey(pubKey ed25519.PublicKey) string {
+	addr := address.NewAddress(0x1, 0x0, pubKey)
+	return addr.String()
+}
+
+// EstimateFee calls the TON Center API to estimate the total transaction fee.
+func EstimateFee(srcAddr, body string) (float64, error) {
+	requestPayload := map[string]interface{}{
+		"address":      srcAddr,
+		"body":         body,
+		"ignoreChksig": true,
+		"initCode":     "",
+		"initData":     "",
 	}
 
 	requestBody, err := json.Marshal(requestPayload)
@@ -51,14 +58,12 @@ func EstimateFee(walletAddress, body string) (float64, error) {
 	}
 
 	url := "https://toncenter.com/api/v2/estimateFee"
-
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
 	if err != nil {
 		return 0, fmt.Errorf("error creating request: %s", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -66,20 +71,20 @@ func EstimateFee(walletAddress, body string) (float64, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("failed to get estimate fee: %s", resp.Status)
-	}
-
 	var respPayload struct {
 		Ok     bool `json:"ok"`
 		Result struct {
 			SourceFees struct {
-				InFwdFee   int64 `json:"in_fwd_fee"`
-				StorageFee int64 `json:"storage_fee"`
-				GasFee     int64 `json:"gas_fee"`
-				FwdFee     int64 `json:"fwd_fee"`
+				InFwdFee   int `json:"in_fwd_fee"`
+				StorageFee int `json:"storage_fee"`
+				GasFee     int `json:"gas_fee"`
+				FwdFee     int `json:"fwd_fee"`
 			} `json:"source_fees"`
 		} `json:"result"`
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("failed to get estimate fee: %s", resp.Status)
 	}
 
 	err = json.NewDecoder(resp.Body).Decode(&respPayload)
@@ -88,33 +93,55 @@ func EstimateFee(walletAddress, body string) (float64, error) {
 	}
 
 	if !respPayload.Ok {
-		return 0, fmt.Errorf("error estimating fee: invalid response")
+		return 0, fmt.Errorf("error from API: estimate fee not found")
 	}
 
-	totalFee := float64(respPayload.Result.SourceFees.InFwdFee +
-		respPayload.Result.SourceFees.StorageFee +
-		respPayload.Result.SourceFees.GasFee +
-		respPayload.Result.SourceFees.FwdFee)
-
-	totalFeeInNano := totalFee / 1000000000.0
-
-	fmt.Printf("Total estimated fee: %.9f TON.\n", totalFeeInNano)
-
-	return totalFeeInNano, nil
+	totalFee := float64(respPayload.Result.SourceFees.InFwdFee + respPayload.Result.SourceFees.StorageFee + respPayload.Result.SourceFees.GasFee + respPayload.Result.SourceFees.FwdFee)
+	return totalFee / 1000000000, nil
 }
 
-func main() {
-	walletAddress := "EQDJlZqZfh1OQ4PY2ze4bSEBznjc8fGzkE2YiP5XLvDv1M6u"
+// createTransactionBody generates the transaction body (BOC) for fee estimation.
+func createTransactionBody(srcAddr, dstAddr string, amount uint64) (string, error) {
+	builder := cell.BeginCell()
 
-	transactionBody, err := createTransactionBody("te6ccgECEAEAAigAART/APSkE/S88sgLAQIBIAIDAgFIBAUB9vLUgwjXGNEh+QDtRNDT/9Mf9AT0BNM/0xXR+CMhoVIguY4SM234IySqAKESuZJtMt5Y+CMB3lQWdfkQ8qEG0NMf1NMH0wzTCdM/0xXRUWi68qJRWrrypvgjKqFSULzyowT4I7vyo1MEgA30D2+hmdAk1yHXCgDyZJEw4g4AeNAg10vAAQHAYLCRW+EB0NMDAXGwkVvg+kAw+CjHBbORMODTHwGCEK5C5aS6nYBA1yHXTPgqAe1V+wTgMAIBIAYHAgJzCAkCASAMDQARrc52omhrhf/AAgEgCgsAGqu27UTQgQEi1yHXCz8AGKo77UTQgwfXIdcLHwAbuabu1E0IEBYtch1wsVgA5bi/Ltou37IasJAoQJsO1E0IEBINch9AT0BNM/0xXRBY4b+CMloVIQuZ8ybfgjBaoAFaESuZIwbd6SMDPikjAz4lIwgA30D2+hntAh1yHXCgCVXwN/2zHgkTDiWYAN9A9voZzQAdch1woAk3/bMeCRW+JwgB/lMJgA30D2+hjhPQUATXGNIAAfJkyFjPFs+DAc8WjhAwyCTPQM+DhAlQBaGlFM9A4vgAyUA5gA30FwTIy/8Tyx/0ABL0ABLLPxLLFcntVPgPIdDTAAHyZdMCAXGwkl8D4PpAAdcLAcAA8qX6QDH6ADH0AfoAMfoAMYBg1yHTAAEPACDyZdIAAZPUMdGRMOJysfsA")
-	if err != nil {
-		log.Fatalf("Error creating transaction body: %v", err)
+	if err := builder.StoreSlice([]byte(srcAddr), uint(len(srcAddr)*8)); err != nil {
+		return "", fmt.Errorf("error storing source address: %s", err)
 	}
 
-	fee, err := EstimateFee(walletAddress, transactionBody)
+	if err := builder.StoreSlice([]byte(dstAddr), uint(len(dstAddr)*8)); err != nil {
+		return "", fmt.Errorf("error storing destination address: %s", err)
+	}
+
+	if err := builder.StoreUInt(amount, 64); err != nil {
+		return "", fmt.Errorf("error storing amount: %s", err)
+	}
+
+	cellBody := builder.EndCell()
+	bocBytes := cellBody.ToBOC()
+	return base64.StdEncoding.EncodeToString(bocBytes), nil
+}
+
+// TestTransactionFee generates wallet data and estimates the transaction fee.
+func TestTransactionFee() {
+	_, _, srcAddr, _, _ := GenerateWalletData() // Source address
+	_, _, dstAddr, _, _ := GenerateWalletData() // Destination address
+
+	amount := "100000000" // Example transaction amount
+	parsedAmount, err := strconv.ParseUint(amount, 10, 64)
 	if err != nil {
-		log.Fatalf("Error estimating fee: %v", err)
+		log.Fatal(err)
+	}
+
+	transactionBody, err := createTransactionBody(srcAddr, dstAddr, parsedAmount)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fee, err := EstimateFee(srcAddr, transactionBody)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	fmt.Printf("Estimated fee: %.9f TON\n", fee)
 }
+
